@@ -9,7 +9,7 @@ Monitors Donald Trump’s RSS feed, uses an LLM (OpenAI or Gemini) to evaluate m
 ## Quick Start
 
 ```bash
-git clone https://github.com/yourname/trump-tweet-monitor.git
+git clone https://github.com/EliotYang/trump-tweet-monitor.git
 cd trump-tweet-monitor
 python3 -m venv .venv
 source .venv/bin/activate
