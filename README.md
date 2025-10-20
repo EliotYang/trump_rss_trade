@@ -1,160 +1,130 @@
----
-
 # Trump Tweet Monitor
 
-Monitors Donald Trump’s RSS feed, uses an LLM (OpenAI or Gemini) to evaluate market impact, and pushes alerts via Server酱.
+监控唐纳德·特朗普的 RSS feed，使用大语言模型（OpenAI 或 Gemini）评估其市场影响，并通过 Server酱 推送警报。
 
----
+[][contributors-url]
+[][forks-url]
+[][stars-url]
+[][issues-url]
+[][license-url]
 
-## Quick Start
+\<br /\>
+\<p align="center"\>
+\<h3 align="center"\>Trump Tweet Monitor\</h3\>
+
+\<p align="center"\>
+一个监控特朗普推文并分析其市场影响的工具。
+\<br /\>
+\<a href="https://github.com/EliotYang/trump-tweet-monitor"\>\<strong\>探索本项目的文档 »\</strong\>\</a\>
+\<br /\>
+\<br /\>
+\<a href="https://github.com/EliotYang/trump-tweet-monitor/issues"\>报告Bug\</a\>
+·
+\<a href="https://github.com/EliotYang/trump-tweet-monitor/issues"\>提出新特性\</a\>
+\</p\>
+\</p\>
+
+## 目录
+
+  - [上手指南](#上手指南)
+  - [开发前的配置要求](#开发前的配置要求)
+    - [安装步骤](#安装步骤)
+    - [配置说明](#配置说明)
+    - [使用说明](#使用说明)
+    - [部署](#部署)
+    - [使用到的框架与服务](#使用到的框架与服务)
+    - [作者](#作者)
+
+
+
+### 上手指南
+
+请根据您的项目信息，将 README 中的链接和占位符替换为实际内容。
+
+###### **开发前的配置要求**
+
+  - Python 3.x
+  - pip
+
+###### **安装步骤**
+
+1.  克隆本项目
+    ```sh
+    git clone https://github.com/EliotYang/trump-tweet-monitor.git
+    ```
+2.  进入项目目录并创建虚拟环境
+    ```bash
+    cd trump-tweet-monitor
+    python3 -m venv .venv
+    source .venv/bin/activate
+    ```
+3.  安装依赖
+    ```sh
+    pip install -U pip
+    pip install requests feedparser
+    ```
+4.  配置 API 密钥及其他设置
+    ```sh
+    cp config.example.ini config.ini
+    ```
+    *然后编辑 `config.ini` 文件，填入你的 OpenAI/Gemini API 密钥和 Server酱 SendKey。*
+
+### 配置说明
+
+项目的所有配置都在 `config.ini` 文件中，详细说明请参照内部的中文翻译。
+
+### 使用说明
+
+直接运行主脚本即可启动监控：
 
 ```bash
-git clone https://github.com/EliotYang/trump-tweet-monitor.git
-cd trump-tweet-monitor
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-pip install requests feedparser
-cp config.example.ini config.ini
 python trump_tweet_monitor.py
 ```
 
----
+程序会根据 `config.ini` 中 `check_interval` 的设定，周期性地检查 RSS feed，分析新条目，并根据推送策略发送通知。
 
-## Configuration (`config.ini`)
+**输出文件:**
 
-Below is what each section means.
+  * `tweet_monitor.log` – 程序运行日志
+  * `analysis_records.json` – 所有的分析结果记录
+  * `analyzed_guids.json` – 已处理过的推文 ID，用于去重
 
-### `[settings]`
+### 部署
 
-| Key                         | Description                                     |
-| --------------------------- | ----------------------------------------------- |
-| `log_file`                  | Path to log file (default: `tweet_monitor.log`) |
-| `log_level`                 | Logging level: `INFO`, `DEBUG`, etc.            |
-| `check_interval`            | Seconds between RSS checks                      |
-| `timezone`                  | Local timezone (e.g., `Asia/Taipei`)            |
-| `daily_report_time`         | Local time (HH:MM) to send daily summary        |
-| `analysis_record_file`      | File storing all analysis results               |
-| `analyzed_guids_file`       | File storing processed tweet fingerprints       |
-| `proxy_enable`              | Whether to use proxy (`true` / `false`)         |
-| `proxy_http`, `proxy_https` | Proxy URLs (if enabled)                         |
+你可以将此脚本作为 systemd 服务在后台持续运行。
 
----
+```bash
+# 以下为示例服务配置，请根据实际路径修改
+# /etc/systemd/system/trump-monitor.service
 
-### `[feed]`
+[Unit]
+Description=Trump Tweet Monitor Service
+After=network.target
 
-| Key       | Description                                          |
-| --------- | ---------------------------------------------------- |
-| `rss_url` | RSS feed to monitor (default: Trump feed via nitter) |
+[Service]
+User=your_user # 替换为你的用户名
+WorkingDirectory=/path/to/trump-tweet-monitor # 替换为项目路径
+ExecStart=/path/to/trump-tweet-monitor/.venv/bin/python trump_tweet_monitor.py
+Restart=always
 
----
+[Install]
+WantedBy=multi-user.target
+```
 
-### `[model]`
-
-| Key          | Description                                  |
-| ------------ | -------------------------------------------- |
-| `provider`   | `openai` or `gemini`                         |
-| `model_name` | Model name (e.g. `gpt-4o`, `gemini-1.5-pro`) |
-
----
-
-### `[openai]` / `[gemini]`
-
-| Key        | Description                             |
-| ---------- | --------------------------------------- |
-| `api_key`  | Your model API key                      |
-| `api_base` | (OpenAI only) custom endpoint if needed |
-
----
-
-### `[server]`
-
-| Key           | Description      |
-| ------------- | ---------------- |
-| `push_method` | `serverchan_sdk` |
-| `send_key`    | Server酱 SDK key  |
-
----
-
-### `[serverchan]`
-
-| Key   | Description                                                |
-| ----- | ---------------------------------------------------------- |
-| `uid` | Optional UID; leave blank if `send_key` already encodes it |
-
----
-
-### `[rate_limit]`
-
-| Key                            | Description                        |
-| ------------------------------ | ---------------------------------- |
-| `model_rpm`                    | Max model API calls per minute     |
-| `push_rpm`                     | Max push requests per minute       |
-| `max_entries_per_cycle`        | Max RSS entries per loop           |
-| `min_sleep_between_entries_ms` | Milliseconds delay between entries |
-
----
-
-### `[prompt.analysis]`
-
-Defines the main LLM prompt.
-You can customize:
-
-* `system_role` – model’s role description
-* `json_schema` – required JSON structure
-* `rules` – short bullet rules
-* `template` – how the final prompt is composed
-
----
-
-### `[prompt.translate]`
-
-Short fallback translation prompt for when JSON fails.
-
-### `[prompt.summary]`
-
-Prompt for daily summary message.
-
----
-
-### `[push.policy]`
-
-| Key                   | Description                                                 |
-| --------------------- | ----------------------------------------------------------- |
-| `push_on_impact`      | Only push when `impact=true`                                |
-| `push_min_importance` | Minimum importance to trigger push (`none/low/medium/high`) |
-
----
-
-### `[push.format]`
-
-| Key                             | Description                      |
-| ------------------------------- | -------------------------------- |
-| `title`, `tags`                 | Push title and tag labels        |
-| `alert_template`                | Template for successful analysis |
-| `fallback_template`             | Template when JSON parsing fails |
-| `max_title_len`, `max_desp_len` | Truncation limits                |
-
----
-
-## Run as Service (optional)
+然后启用并启动服务：
 
 ```bash
 sudo systemctl enable trump-monitor
 sudo systemctl start trump-monitor
 ```
 
----
+### 使用到的框架与服务
 
-## Output Files
+  - [Python](https://www.python.org/)
+  - [OpenAI API](https://openai.com/blog/openai-api) / [Google Gemini API](https://ai.google.dev/)
+  - [Server酱](https://www.google.com/search?q=http://sc.ftqq.com/)
 
-* `tweet_monitor.log` – logs
-* `analysis_records.json` – all analyses
-* `analyzed_guids.json` – processed tweet IDs
+### 作者
 
----
-
-## License
-
-MIT License
-
+**EliotYang** - *Initial work* - [EliotYang](https://www.google.com/search?q=https://github.com/EliotYang)
+小红书账号：- [城下](https://www.xiaohongshu.com/user/profile/680df0be000000000e012b52）
