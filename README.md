@@ -2,27 +2,14 @@
 
 监控唐纳德·特朗普的 RSS feed，使用大语言模型（OpenAI 或 Gemini）评估其市场影响，并通过 Server酱 推送警报。
 
-[][contributors-url]
-[][forks-url]
-[][stars-url]
-[][issues-url]
-[][license-url]
+<!-- PROJECT SHIELDS -->
 
-\<br /\>
-\<p align="center"\>
-\<h3 align="center"\>Trump Tweet Monitor\</h3\>
-
-\<p align="center"\>
-一个监控特朗普推文并分析其市场影响的工具。
-\<br /\>
-\<a href="https://github.com/EliotYang/trump-tweet-monitor"\>\<strong\>探索本项目的文档 »\</strong\>\</a\>
-\<br /\>
-\<br /\>
-\<a href="https://github.com/EliotYang/trump-tweet-monitor/issues"\>报告Bug\</a\>
-·
-\<a href="https://github.com/EliotYang/trump-tweet-monitor/issues"\>提出新特性\</a\>
-\</p\>
-\</p\>
+[![Contributors][contributors-shield]][contributors-url]
+[![Forks][forks-shield]][forks-url]
+[![Stargazers][stars-shield]][stars-url]
+[![Issues][issues-shield]][issues-url]
+[![MIT License][license-shield]][license-url]
+[![LinkedIn][linkedin-shield]][linkedin-url]
 
 ## 目录
 
@@ -127,4 +114,4 @@ sudo systemctl start trump-monitor
 ### 作者
 
 **EliotYang** - *Initial work* - [EliotYang](https://www.google.com/search?q=https://github.com/EliotYang)
-小红书账号：- [城下](https://www.xiaohongshu.com/user/profile/680df0be000000000e012b52）
+小红书账号：- [城下](https://www.xiaohongshu.com/user/profile/680df0be000000000e012b52)
