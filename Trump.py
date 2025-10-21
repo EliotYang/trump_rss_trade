@@ -14,6 +14,16 @@ from zoneinfo import ZoneInfo  # Python 3.9+
 import email.utils
 import calendar
 from dataclasses import dataclass
+import html
+import unicodedata
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+# 尝试使用 BeautifulSoup 提升 HTML 清洗质量；没有则回退到正则
+try:
+    from bs4 import BeautifulSoup  # pip install beautifulsoup4
+    _HAS_BS4 = True
+except Exception:
+    _HAS_BS4 = False
 
 # =========================
 # 日志初始化（避免重复 handlers）
@@ -22,7 +32,6 @@ def init_logging(log_file: str, log_level: str = "INFO"):
     level = getattr(logging, log_level.upper(), logging.INFO)
     root = logging.getLogger()
     if root.handlers:
-        # 如果已经初始化过，则重设级别并返回
         root.setLevel(level)
         return
     logging.basicConfig(
@@ -43,10 +52,151 @@ def _cfg_get_multiline(cfg: configparser.ConfigParser, section: str, option: str
     return fallback.strip()
 
 # =========================
+# 文本规范化 / HTML 清洗 / URL 标准化（新增）
+# =========================
+def _normalize_unicode(s: str) -> str:
+    """Unicode 规范化，降低标点/空格变体导致的误差"""
+    return unicodedata.normalize("NFKC", s or "")
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+def _strip_html_keep_text(s: str) -> str:
+    """
+    将 HTML → 纯文本：
+    1) html.unescape 反转义实体
+    2) 首选 BeautifulSoup 去标签；若不可用退化到正则
+    3) 合并多余空白
+    4) NFKC 规范化
+    """
+    if not s:
+        return ""
+    s = html.unescape(s)
+    if _HAS_BS4:
+        try:
+            text = BeautifulSoup(s, "html.parser").get_text(separator=" ", strip=True)
+        except Exception:
+            text = _TAG_RE.sub(" ", s)
+    else:
+        text = _TAG_RE.sub(" ", s)
+    text = _WS_RE.sub(" ", text).strip()
+    return _normalize_unicode(text)
+
+def _best_entry_body(entry) -> str:
+    """
+    选择正文的“最佳可用字段”：
+    content[].value → summary → description → ""
+    并做 HTML → 纯文本清洗
+    """
+    # content
+    if hasattr(entry, "content"):
+        try:
+            contents = entry.content or []
+            for c in contents:
+                v = c.get("value") if isinstance(c, dict) else getattr(c, "value", None)
+                v = _strip_html_keep_text(v)
+                if v:
+                    return v
+        except Exception:
+            pass
+    # summary
+    if hasattr(entry, "summary"):
+        v = _strip_html_keep_text(getattr(entry, "summary", "") or "")
+        if v:
+            return v
+    # description
+    if hasattr(entry, "description"):
+        v = _strip_html_keep_text(getattr(entry, "description", "") or "")
+        if v:
+            return v
+    return ""
+
+def _normalize_link(url: Optional[str]) -> Optional[str]:
+    """
+    URL 标准化：
+    - 去掉 #fragment
+    - 过滤 utm_* 等追踪参数
+    - 统一域名小写
+    - 去掉尾随斜杠（保留根 '/'）
+    """
+    if not url:
+        return None
+    try:
+        p = urlparse(url)
+        fragment = ""
+        q = []
+        for k, v in parse_qsl(p.query, keep_blank_values=True):
+            if k.lower().startswith("utm_"):
+                continue
+            q.append((k, v))
+        query = urlencode(q, doseq=True)
+        path = p.path.rstrip("/") or "/"
+        normalized = urlunparse((p.scheme, p.netloc.lower(), path, p.params, query, fragment))
+        return normalized
+    except Exception:
+        return url
+
+_WEAK_TITLE_RE = re.compile(r"^\[?No Title\]? - Post from", re.IGNORECASE)
+
+def entry_text_for_llm(entry) -> str:
+    """
+    构造送模型的“净文本”：标题（若非系统占位） + 正文
+    """
+    title_raw = getattr(entry, "title", "") or ""
+    title = _strip_html_keep_text(title_raw)
+    weak_title = bool(_WEAK_TITLE_RE.match(title))
+    body = _best_entry_body(entry)
+
+    if title and not weak_title:
+        if body:
+            return f"{title}\n{body}"
+        return title
+    return body
+
+def is_effectively_empty(text: str, min_len: int = 8) -> bool:
+    """清洗后的可见文本长度是否过短（默认 <8 视为空）"""
+    if not text:
+        return True
+    return len(text.strip()) < min_len
+
+def stable_fingerprint(entry) -> str:
+    """
+    稳定指纹：优先 id/guid/link（标准化 URL）→ 回退 title+pubDate → 最后 str(entry)
+    对原料先做 Unicode 规范化，URL 标准化，降低误判/漏判。
+    """
+    parts: List[str] = []
+
+    cand = None
+    for k in ("id", "guid", "link"):
+        if hasattr(entry, k) and getattr(entry, k):
+            v = str(getattr(entry, k))
+            if k == "link":
+                v = _normalize_link(v) or v
+            cand = v
+            break
+    if cand:
+        parts.append(_normalize_unicode(cand))
+    else:
+        title = _normalize_unicode(getattr(entry, "title", "") or "")
+        pub = ""
+        for k in ("published", "pubDate", "updated", "created", "dc_date"):
+            if hasattr(entry, k) and getattr(entry, k):
+                pub = _normalize_unicode(str(getattr(entry, k)))
+                break
+        if title:
+            parts.append(title)
+        if pub:
+            parts.append(pub)
+        if not parts:
+            parts.append(_normalize_unicode(str(entry)))
+
+    raw = "||".join(parts)
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+# =========================
 # 推送抽象与实现
 # =========================
 class Pusher:
-    """推送抽象基类，便于扩展多种推送方式"""
     def push(self, message: str, title: Optional[str] = None, tags: Optional[str] = None):
         raise NotImplementedError
 
@@ -67,7 +217,6 @@ class ServerChanSDKPusher(Pusher):
         if uid_override:
             self.uid = uid_override
         else:
-            # 放宽匹配，尽量兼容
             m = re.search(r"sctp(\d+)t", send_key or "")
             self.uid = m.group(1) if m else None
             if not self.uid:
@@ -86,8 +235,7 @@ class ServerChanSDKPusher(Pusher):
         headers = {"Content-Type": "application/json"}
         try:
             resp = self.session.post(url, headers=headers, json=payload, timeout=10)
-            # 打印原始返回以便排错
-            print(resp.text)
+            print(resp.text)  # 原始返回便于排错
             if resp.status_code != 200:
                 logging.error(f"ServerChan API 推送失败: {resp.text}")
         except Exception as e:
@@ -110,14 +258,6 @@ ALLOWED_IMPORTANCE = {"high", "medium", "low", "none"}
 IMPORTANCE_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
 def validate_result(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    最小可用的schema校验 & 规范化：
-    - impact: bool
-    - importance: in {"high","medium","low","none"}
-    - asset_class: list[str]
-    - reason: str
-    - original_cn: str
-    """
     if not isinstance(obj, dict):
         return None
     impact = obj.get("impact", None)
@@ -137,7 +277,6 @@ def validate_result(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     original_cn = obj.get("original_cn", "")
     if not isinstance(original_cn, str):
         return None
-    # 规范化返回
     return {
         "impact": impact,
         "importance": importance,
@@ -147,15 +286,8 @@ def validate_result(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 def iter_possible_json_blobs(text: str) -> List[str]:
-    """
-    返回文本中可能的 JSON 片段候选：
-    - 处理 ```json ... ``` 代码块
-    - 处理裸 JSON
-    - 处理嵌套花括号的平衡扫描
-    """
     candidates: List[str] = []
 
-    # 1) ```json ... ``` or ``` ... ```
     fence_patterns = [
         (r"```json\s*(.*?)\s*```", re.DOTALL),
         (r"```\s*(\{[\s\S]*?\})\s*```", re.DOTALL)
@@ -164,10 +296,9 @@ def iter_possible_json_blobs(text: str) -> List[str]:
         for m in re.finditer(pat, text, flags=flag):
             candidates.append(m.group(1))
 
-    # 2) 平衡扫描：寻找每个 '{' 出发的成对 '}' 片段（限制复杂度）
     s = text
     opens = [i for i, ch in enumerate(s) if ch == '{']
-    if len(opens) <= 300:  # 粗略限制，防止超大文本耗时
+    if len(opens) <= 300:
         for i in opens:
             depth = 0
             for j in range(i, len(s)):
@@ -176,17 +307,14 @@ def iter_possible_json_blobs(text: str) -> List[str]:
                 elif s[j] == '}':
                     depth -= 1
                     if depth == 0:
-                        # 限制单片段最大长度，避免吞掉整篇
                         if j + 1 - i <= 10000:
                             candidates.append(s[i:j+1])
                         break
 
-    # 3) 简单正则的第一个 {...}（容易贪婪，放到最后作为兜底）
     m = re.search(r"\{[\s\S]*\}", text)
     if m and len(m.group(0)) <= 10000:
         candidates.append(m.group(0))
 
-    # 去重，保序
     seen = set()
     uniq: List[str] = []
     for c in candidates:
@@ -197,10 +325,6 @@ def iter_possible_json_blobs(text: str) -> List[str]:
     return uniq
 
 def robust_extract_json(text: str) -> Optional[Dict[str, Any]]:
-    """
-    迭代尝试不同候选片段进行 json.loads + schema 校验。
-    """
-    # 先直接尝试整体
     try:
         obj = json.loads(text)
         valid = validate_result(obj)
@@ -209,7 +333,6 @@ def robust_extract_json(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         pass
 
-    # 逐个候选
     for cand in iter_possible_json_blobs(text):
         try:
             obj = json.loads(cand)
@@ -221,61 +344,18 @@ def robust_extract_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 # =========================
-# RSS 条目去重指纹 & 时间解析
+# RSS 条目时间解析
 # =========================
-def get_entry_fingerprint(entry) -> str:
-    """
-    指纹优先顺序：
-    1. entry.id 或 guid
-    2. link
-    3. title + pubDate
-    最后做 sha256
-    """
-    parts: List[str] = []
-
-    # 优先 id/guid/link
-    val = None
-    if hasattr(entry, "id") and entry.id:
-        val = str(entry.id)
-    elif hasattr(entry, "guid") and entry.guid:
-        val = str(entry.guid)
-    elif hasattr(entry, "link") and entry.link:
-        val = str(entry.link)
-    else:
-        # 兜底：title + pubDate
-        title = getattr(entry, "title", "") or ""
-        pub_date_str = getattr(entry, "pubDate", None) or getattr(entry, "published", None) or ""
-        if title:
-            parts.append(str(title))
-        if pub_date_str:
-            parts.append(str(pub_date_str))
-
-    if val:
-        parts.append(val)
-
-    if not parts:
-        # 极端兜底：将整个 entry 文本化
-        parts.append(str(entry))
-    raw = "||".join(parts)
-    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
-
 def parse_datetime_any(dt_str: str) -> Optional[datetime.datetime]:
-    """
-    既支持 RFC822/邮件头，也支持 ISO8601（含Z）。
-    返回带时区的 aware datetime（尽量转为 UTC）。
-    """
     if not dt_str:
         return None
-    # 1) 先走邮件头风格
     try:
         dt = email.utils.parsedate_to_datetime(dt_str)
         if dt and dt.tzinfo is None:
-            # 假定为 UTC
             dt = dt.replace(tzinfo=datetime.timezone.utc)
         return dt
     except Exception:
         pass
-    # 2) ISO8601: 允许尾部 Z
     try:
         s = dt_str.strip().replace("Z", "+00:00")
         dt = datetime.datetime.fromisoformat(s)
@@ -286,21 +366,15 @@ def parse_datetime_any(dt_str: str) -> Optional[datetime.datetime]:
         return None
 
 def get_entry_datetime(entry) -> Optional[datetime.datetime]:
-    """
-    优先使用 feedparser 的 *_parsed 字段；其次解析常见字符串字段。
-    统一返回 UTC aware datetime。
-    """
-    # a) *_parsed（struct_time，通常为 GMT/UTC）
     for k in ("published_parsed", "updated_parsed", "created_parsed"):
         if hasattr(entry, k):
             st = getattr(entry, k)
             if st:
                 try:
-                    ts = calendar.timegm(st)  # 按UTC解释
+                    ts = calendar.timegm(st)
                     return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
                 except Exception:
                     pass
-    # b) 常见字符串字段
     for k in ("published", "pubDate", "updated", "created", "dc_date"):
         if hasattr(entry, k):
             dt = parse_datetime_any(getattr(entry, k))
@@ -309,9 +383,6 @@ def get_entry_datetime(entry) -> Optional[datetime.datetime]:
     return None
 
 def parse_rfc822_dt(dt_str: str) -> Optional[datetime.datetime]:
-    """
-    解析 RFC822/通用邮件日期为 aware datetime
-    """
     try:
         return datetime.datetime.strptime(dt_str, "%a, %d %b %Y %H:%M:%S %z")
     except Exception:
@@ -321,7 +392,7 @@ def parse_rfc822_dt(dt_str: str) -> Optional[datetime.datetime]:
             return None
 
 # =========================
-# 轻量 POST 重试包装（可选）
+# 轻量 POST 重试包装
 # =========================
 @dataclass
 class RetryConfig:
@@ -334,7 +405,6 @@ def post_with_retry(session: requests.Session, url: str, *, headers=None, params
     for i in range(retry.retries + 1):
         try:
             resp = session.post(url, headers=headers, params=params, json=json_body, timeout=timeout)
-            # 对 429/5xx 做简单重试
             if resp.status_code >= 500 or resp.status_code == 429:
                 raise requests.HTTPError(f"status={resp.status_code}, body={resp.text[:200]}")
             return resp
@@ -354,12 +424,10 @@ class TrumpTweetMonitor:
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"配置文件不存在: {config_path}")
 
-        # 读取配置
         self.config = configparser.ConfigParser()
         with open(config_path, "r", encoding="utf-8") as f:
             self.config.read_file(f)
 
-        # 先读取日志配置并立即初始化日志（确保最早的日志也能写入）
         self.log_file = self.config.get("settings", "log_file", fallback="tweet_monitor.log")
         self.log_level = self.config.get("settings", "log_level", fallback="INFO")
         init_logging(self.log_file, self.log_level)
@@ -379,8 +447,8 @@ class TrumpTweetMonitor:
         self.analyzed_guids_file = self.config.get("settings", "analyzed_guids_file", fallback="analyzed_guids.json")
         self.analyzed_guids = self.load_analyzed_guids()
 
-        # ---- 时区 & start_time 正确处理 ----
-        self.timezone_name = self.config.get("settings", "timezone", fallback="Asia/Taipei")
+        # ---- 时区 & start_time 正确处理（默认 Asia/Singapore）----
+        self.timezone_name = self.config.get("settings", "timezone", fallback="Asia/Singapore")
         try:
             self.tz = ZoneInfo(self.timezone_name)
         except Exception:
@@ -390,7 +458,6 @@ class TrumpTweetMonitor:
         start_time_str = self.config.get("settings", "start_time", fallback=None)
         if start_time_str:
             try:
-                # 假定配置是“本地时区”的人类时间，先本地化，再转 UTC
                 naive = datetime.datetime.strptime(start_time_str, "%Y-%m-%d %H:%M")
                 localized = naive.replace(tzinfo=self.tz)
                 self.start_time_utc = localized.astimezone(datetime.timezone.utc)
@@ -400,11 +467,9 @@ class TrumpTweetMonitor:
         else:
             self.start_time_utc = None
 
-        # ---- 日报触发：显式时刻（默认 08:00） ----
         self.daily_report_time = self.config.get("settings", "daily_report_time", fallback="08:00")
         self.daily_state_file = self.config.get("settings", "daily_state_file", fallback="daily_report_state.json")
 
-        # HTTP 会话（带可选代理）
         self.session = requests.Session()
         if self.proxy_enable:
             self.session.proxies.update({"http": self.proxy_http, "https": self.proxy_https})
@@ -413,7 +478,6 @@ class TrumpTweetMonitor:
         self.push_method = self.config.get("server", "push_method", fallback="serverchan_sdk")
         self.send_key = self.config.get("server", "send_key", fallback=None)
 
-        # ---- Prompt 配置读取 ----
         self.prompt_analysis_template = _cfg_get_multiline(self.config, "prompt.analysis", "template")
         self.prompt_analysis_system_role = _cfg_get_multiline(self.config, "prompt.analysis", "system_role")
         self.prompt_analysis_json_schema = _cfg_get_multiline(self.config, "prompt.analysis", "json_schema")
@@ -422,7 +486,6 @@ class TrumpTweetMonitor:
         self.prompt_translate_template = _cfg_get_multiline(self.config, "prompt.translate", "template")
         self.prompt_summary_template = _cfg_get_multiline(self.config, "prompt.summary", "template")
 
-        # ---- 推送策略/文案 ----
         self.push_on_impact = self.config.getboolean("push.policy", "push_on_impact", fallback=True)
         self.push_min_importance = self.config.get("push.policy", "push_min_importance", fallback="high").strip().lower()
         self.push_title = self.config.get("push.format", "title", fallback="特朗普推文预警")
@@ -438,10 +501,8 @@ class TrumpTweetMonitor:
         self.push_max_title_len = self.config.getint("push.format", "max_title_len", fallback=64)
         self.push_max_desp_len = self.config.getint("push.format", "max_desp_len", fallback=512)
 
-        # ---- ServerChan uid 兜底 ----
         self.serverchan_uid = self.config.get("serverchan", "uid", fallback="").strip()
 
-        # ---- 限速配置（Token Bucket）----
         self.model_rpm = self.config.getint("rate_limit", "model_rpm", fallback=30)
         self.push_rpm = self.config.getint("rate_limit", "push_rpm", fallback=20)
         self.max_entries_per_cycle = self.config.getint("rate_limit", "max_entries_per_cycle", fallback=50)
@@ -463,7 +524,6 @@ class TrumpTweetMonitor:
             },
         }
 
-        # ---- 推送器 ----
         self.pusher = PusherFactory.create_pusher(
             self.push_method, self.send_key, self.session,
             self.push_title, self.push_tags, self.push_max_title_len, self.push_max_desp_len,
@@ -476,7 +536,6 @@ class TrumpTweetMonitor:
 
     # ---------- Prompt ----------
     def build_prompt(self, tweet_text: str) -> str:
-        # 配置化模板：支持 {system_role} / {json_schema} / {rules} / {tweet_text}
         if self.prompt_analysis_template:
             return self.prompt_analysis_template.format(
                 system_role=self.prompt_analysis_system_role,
@@ -484,7 +543,6 @@ class TrumpTweetMonitor:
                 rules=self.prompt_analysis_rules,
                 tweet_text=tweet_text
             ).strip()
-        # 兼容旧版回退
         default_template = f"""{self.prompt_analysis_system_role or "你是一名资深全球宏观与多资产策略师。请对下面的特朗普相关文本进行**市场影响**评估。请注意现在的时间节点特朗普已经上台且两院都在共和党手中。"}
 
 务必严格按以下**唯一 JSON**结构输出（不要解释、不要代码块、不要多余文字）：
@@ -500,17 +558,12 @@ class TrumpTweetMonitor:
 
     # ---------- 令牌桶限速 ----------
     def _acquire_token(self, bucket: str, permits: int = 1, timeout_sec: float = 10.0) -> bool:
-        """
-        简单令牌桶：不足则等待，直到超时或获得。
-        bucket: "model" | "push"
-        """
         if bucket not in self._rate_limits:
-            return True  # 未配置则直接放行
+            return True
         rl = self._rate_limits[bucket]
         deadline = time.monotonic() + timeout_sec
         while True:
             now = time.monotonic()
-            # 先补发令牌
             elapsed = max(0.0, now - rl["updated"])
             refill = elapsed * rl["rate_per_sec"]
             if refill > 0:
@@ -519,7 +572,6 @@ class TrumpTweetMonitor:
             if rl["tokens"] >= permits:
                 rl["tokens"] -= permits
                 return True
-            # 不够令牌，计算需要等待的时间
             need = permits - rl["tokens"]
             wait_sec = need / rl["rate_per_sec"] if rl["rate_per_sec"] > 0 else 0.5
             if wait_sec <= 0:
@@ -586,10 +638,6 @@ class TrumpTweetMonitor:
 
     # ---------- 兜底功能 ----------
     def quick_translate_cn(self, text: str) -> Optional[str]:
-        """
-        在模型无法返回JSON时，用极简prompt做兜底中文翻译（最多120字）。
-        注意：不要求JSON，返回字符串即可。
-        """
         tmpl = self.prompt_translate_template or "请把以下英文或混合文本准确翻译成简洁中文（最多120字），只输出译文：\n{source_text}"
         prompt = tmpl.format(source_text=text)
         try:
@@ -622,9 +670,6 @@ class TrumpTweetMonitor:
         return None
 
     def quick_summarize(self, text: str) -> Optional[str]:
-        """
-        日报摘要：让模型做简短中文摘要（不要求 JSON），返回字符串。
-        """
         tmpl = self.prompt_summary_template or "请将以下内容总结为一份简洁的中文日报（200字内，突出高重要性与市场影响）：\n{source_text}"
         prompt = tmpl.format(source_text=text)
         try:
@@ -698,12 +743,10 @@ class TrumpTweetMonitor:
             return None
         if not summary_records:
             return None
-        # 拼接摘要原始文本
         summary_text = "昨日特朗普推文市场影响日报：\n"
         for rec in summary_records:
             result = rec["result"]
             if not result:
-                # 记录过但无结构化结果
                 raw = (rec.get('tweet_text', '') or '').replace("\n", " ")
                 summary_text += f"- （未解析）{raw[:80]}...\n"
                 continue
@@ -712,7 +755,6 @@ class TrumpTweetMonitor:
                 f"重要性: {result.get('importance')} | 资产: {result.get('asset_class')} | "
                 f"理由: {result.get('reason')}\n"
             )
-        # 交给模型做精简（非 JSON）
         summary = self.quick_summarize(summary_text)
         return summary or summary_text
 
@@ -761,7 +803,7 @@ class TrumpTweetMonitor:
             try:
                 logging.info("🚀 进入主循环")
 
-                # ---- 可靠的日报触发（窗口判定）----
+                # ---- 日报触发（窗口判定）----
                 try:
                     state = self._load_daily_state()
                     now_local = datetime.datetime.now(self.tz)
@@ -771,7 +813,7 @@ class TrumpTweetMonitor:
                         target = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
                     except Exception:
                         target = now_local.replace(hour=8, minute=0, second=0, microsecond=0)
-                    window_sec = 60  # 60秒窗口
+                    window_sec = 60
                     diff = (now_local - target).total_seconds()
                     logging.debug(f"⏰ 日报检查：now={now_local}, target={target}, diff={diff:.1f}s, last_sent={state.get('last_sent_date')}")
                     if state.get("last_sent_date") != today_key and 0 <= diff < window_sec:
@@ -782,7 +824,7 @@ class TrumpTweetMonitor:
                 except Exception as e:
                     logging.error(f"日报触发错误: {e}")
 
-                # ---- 拉取RSS（遵循代理）----
+                # ---- 拉取RSS ----
                 logging.info("🔄 开始一次 RSS 轮询")
                 try:
                     resp = self.session.get(self.rss_url, timeout=15)
@@ -800,11 +842,9 @@ class TrumpTweetMonitor:
                     time.sleep(self.check_interval)
                     continue
 
-                # ---- 限制本轮最多处理的条目数 ----
                 entries = list(feed.entries)[: self.max_entries_per_cycle]
                 logging.info(f"🧮 本轮计划处理条目数: {len(entries)}（上限 {self.max_entries_per_cycle}）")
                 for entry in entries:
-                    # 统一获取发布时间（UTC aware）
                     pub_dt_utc = get_entry_datetime(entry)
                     if pub_dt_utc:
                         logging.debug(f"条目时间: {pub_dt_utc.isoformat()} vs 起始阈值: {self.start_time_utc}")
@@ -815,37 +855,33 @@ class TrumpTweetMonitor:
                         logging.debug("⏭️ 跳过：无法解析发布时间（无 *_parsed / 无法解析字符串）")
                         continue
 
-                    # start_time 过滤（直接对 UTC 比较）
                     if self.start_time_utc and pub_dt_utc < self.start_time_utc:
                         logging.debug(f"⏭️ 跳过：早于 start_time（{pub_dt_utc.isoformat()} < {self.start_time_utc.isoformat()}）")
                         continue
 
-                    # 稳定指纹去重
-                    fp = get_entry_fingerprint(entry)
+                    # —— 使用“稳定”指纹去重（含 URL/Unicode 标准化）——
+                    fp = stable_fingerprint(entry)
                     if fp in self.analyzed_guids:
                         logging.debug("⏭️ 跳过：指纹已存在（去重命中）")
                         continue
 
-                    title = getattr(entry, "title", "").strip() if hasattr(entry, "title") else ""
-                    description = getattr(entry, "description", "").strip() if hasattr(entry, "description") else ""
-                    link = getattr(entry, "link", None)
-
-                    if not title and not description:
-                        logging.debug("⏭️ 跳过：无标题且无摘要/描述")
+                    # —— 构造净文本并过滤空内容 —— 
+                    tweet_text = entry_text_for_llm(entry)
+                    if is_effectively_empty(tweet_text):
+                        logging.debug("⏭️ 跳过：净文本为空（标题/正文均无有效内容）")
+                        # 即便空，也记 fingerprint，防止源重复推空帖反复处理
+                        self.analyzed_guids.add(fp)
+                        self.save_analyzed_guids()
                         continue
 
-                    tweet_text = title
-                    if description:
-                        tweet_text += "\n" + description
-
-                    logging.info(f"🆕 检测到新推文: {title or '[无标题]'}")
+                    link = _normalize_link(getattr(entry, "link", None))
+                    logging.info(f"🆕 检测到新推文: {(_strip_html_keep_text(getattr(entry, 'title', '') or '') or '[无标题]')}")
                     result = self.analyze_with_model(tweet_text)
 
                     if result:
                         logging.info(f"✅ 分析结果: {result}")
                         self.save_analysis_record(tweet_text, result)
 
-                        # ---- 策略化触发推送 ----
                         imp = str(result.get("importance", "none")).lower().strip()
                         impact_flag = bool(result.get("impact") is True)
                         threshold = IMPORTANCE_ORDER.get(self.push_min_importance, 3)
@@ -864,20 +900,16 @@ class TrumpTweetMonitor:
                             )
                             self.push_with_rate_limit(msg)
                     else:
-                        # ---- 无JSON 回退：附原文链接 + 快速翻译 ----
                         logging.warning("⚠️ 模型未返回有效 JSON，执行回退推送")
                         brief_cn = self.quick_translate_cn(tweet_text) or "(翻译失败)"
                         link_line = f"原文链接：{link}" if link else ""
                         fallback_msg = self.push_fallback_template.format(brief_cn=brief_cn, link_line=link_line)
                         self.push_with_rate_limit(fallback_msg)
-                        # 也写一条“空结果”的记录
                         self.save_analysis_record(tweet_text, None)
 
-                    # 标记为已分析（用稳定指纹）
                     self.analyzed_guids.add(fp)
                     self.save_analyzed_guids()
 
-                    # ---- 条目间最小间隔 ----
                     if self.min_sleep_between_entries_ms > 0:
                         time.sleep(self.min_sleep_between_entries_ms / 1000.0)
 
