@@ -1,6 +1,6 @@
 # Trump Tweet Monitor
 
-监控唐纳德·特朗普的 RSS feed，使用大语言模型（OpenAI 或 Gemini）评估其市场影响，并通过 Server酱 推送警报。
+监控唐纳德·特朗普的 RSS feed，使用大语言模型（OpenAI/Gemini/千问）评估其市场影响，并通过 Server酱 推送警报。
 
 ## 目录
 
@@ -46,7 +46,7 @@
     ```sh
     cp config.example.ini config.ini
     ```
-    *然后编辑 `config.ini` 文件，填入你的 OpenAI/Gemini API 密钥和 Server酱 SendKey。*
+    然后编辑 `config.ini` 文件，填入你的 OpenAI/Gemini API 密钥（qwen等支持openai样式的其他大模型服务可以在openai中填写对应信息）和 Server酱 SendKey。
 
 ### 配置说明
 
